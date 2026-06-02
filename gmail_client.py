@@ -1,5 +1,6 @@
 """Gmail fetcher + offer parser for Capital One Shopping emails."""
 
+import base64
 import html
 import json
 import os
@@ -126,7 +127,8 @@ def extract_store(subject: str, snippet: str) -> str:
         r'^([\w][\w\s&\.\'\-]+?)\s+[Oo]ffer:',                        # "{STORE} Offer: ..."
         r'[Ss]ave\s+on\s+.+?\bat\s+([\w][\w\s&\.\'\-]+?)(?:[,!]|$)', # "Save on X at {STORE}"
         r'[-|]\s+([\w][\w\s&\.\'\-]+?)(?:\.com)?[!]?\s*$',            # "- QVC.com!" at end
-        r'\bat\s+([\w][\w\s&\.\'\-]{2,30}?)(?:[!,\.]|$)',             # broad fallback: "at {STORE}"
+        r'\bat\s+([\w][\w\s&\.\'\-]{2,30}?)(?:[!,\.]|$)',             # broad "at {STORE}"
+        r'[Ss]ave\s+on\s+([A-Z]\w+)',                                  # "Save on {Brand} product…" (no store suffix)
     ]
     for pat in subject_pats:
         m = re.search(pat, subject, re.IGNORECASE)
@@ -144,69 +146,6 @@ def _clean_store(name: str) -> str:
     return name
 
 
-def extract_cashback(subject: str, snippet: str) -> tuple[float, str]:
-    """Return (numeric_value_for_sorting, display_label)."""
-    combined = _normalize(snippet + ' ' + subject)
-
-    # Price drop amount
-    drop_m = re.search(r'Price Drop \$?([\d,]+(?:\.\d+)?)', combined, re.IGNORECASE)
-    drop_label = f"${drop_m.group(1).replace(',','')} off + " if drop_m else ''
-
-    # Percentage
-    pct_m = (
-        re.search(r'(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%\s*(?:back|in Rewards|Rewards?)', combined, re.IGNORECASE)
-        or re.search(r'(?:Earn|Get)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%', combined, re.IGNORECASE)
-    )
-
-    # Dollar amount back
-    dollar_m = re.search(
-        r'(?:up\s+to\s+)?\$(\d+(?:\.\d+)?)\s*(?:back|in Rewards)',
-        combined, re.IGNORECASE
-    )
-
-    if pct_m:
-        val = float(pct_m.group(1))
-        # Detect "up to" prefix
-        pre_text = combined[:combined.lower().find(pct_m.group(0).lower())]
-        prefix = 'Up to ' if re.search(r'up\s+to\s*$', pre_text.strip(), re.IGNORECASE) else ''
-        return val, f"{drop_label}{prefix}{pct_m.group(1)}%"
-
-    if dollar_m:
-        val = float(dollar_m.group(1))
-        return val, f"{drop_label}${dollar_m.group(1)} back"
-
-    return 0.0, '—'
-
-
-def classify_type(subject: str, snippet: str) -> str:
-    s = subject.lower()
-    if 'price drop' in s:
-        return 'price'
-    if 'expiring soon' in s:
-        return 'expiring'
-    if 'activate rewards' in s:
-        return 'activate'
-    if 'offer alert' in s or 'new rewards offer' in s:
-        return 'offer'
-    if 'coupon' in snippet.lower():
-        return 'coupon'
-    return 'offer'
-
-
-def extract_expiry(snippet: str) -> str:
-    # "Rewards offer ends on June 1, 2026"
-    m = re.search(r'ends\s+on\s+(\w+\s+\d+,?\s*\d{4})', snippet, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    # "Expiring Jun 1"
-    m = re.search(r'[Ee]xpir(?:ing|es?)\s+(\w{3,9}\s+\d+)', snippet)
-    if m:
-        return m.group(1).strip()
-    if 'single-use' in snippet.lower():
-        return 'Single-use'
-    return '—'
-
-
 def _parse_date(date_str: str) -> datetime:
     try:
         return parsedate_to_datetime(date_str).astimezone(timezone.utc)
@@ -215,11 +154,100 @@ def _parse_date(date_str: str) -> datetime:
 
 
 # ---------------------------------------------------------------------------
+# Body decoding
+# ---------------------------------------------------------------------------
+
+def _decode_payload(payload: dict) -> str:
+    """Recursively extract plain text from a MIME payload, preferring text/plain."""
+    mime = payload.get('mimeType', '')
+
+    if mime == 'text/plain':
+        data = payload.get('body', {}).get('data', '')
+        if data:
+            return base64.urlsafe_b64decode(data + '==').decode('utf-8', errors='ignore')
+
+    if mime == 'text/html':
+        data = payload.get('body', {}).get('data', '')
+        if data:
+            text = base64.urlsafe_b64decode(data + '==').decode('utf-8', errors='ignore')
+            text = re.sub(r'<[^>]+>', ' ', text)
+            text = re.sub(r'[ \t]+', ' ', text)
+            return text
+
+    # Multipart: recurse, prefer plain over html
+    plain, fallback = '', ''
+    for part in payload.get('parts', []):
+        result = _decode_payload(part)
+        if not result:
+            continue
+        if part.get('mimeType', '').startswith('text/plain'):
+            plain = plain + '\n' + result
+        else:
+            fallback = fallback + '\n' + result
+
+    return plain.strip() or fallback.strip()
+
+
+# ---------------------------------------------------------------------------
+# Multi-offer extraction from body
+# ---------------------------------------------------------------------------
+
+# Patterns that yield (cashback_num_group, label_suffix, store_group)
+_BODY_PCT_RE = re.compile(
+    r'(?:Earn|Get)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%'
+    r'\s*(?:in\s+Rewards?|back|Rewards?)[^@\n]{0,60}?'
+    r'\bat\s+([\w][\w\s&\.\'\-]{2,38}?)(?=\.|,|\s+You\s|\s+Up\s|\s+Get\s|\n|$)',
+    re.IGNORECASE,
+)
+
+_BODY_DOLLAR_RE = re.compile(
+    r'(?:Earn|Get)\s+(?:up\s+to\s+)?\$(\d+(?:\.\d+)?)'
+    r'\s+(?:in\s+)?Rewards?\s+at\s+([\w][\w\s&\.\'\-]{2,38}?)(?=\.|,|\s+You\s|\s+Get\s|\n|$)',
+    re.IGNORECASE,
+)
+
+
+def _extract_offers_from_body(body: str, received: datetime, thread_id: str) -> list[dict]:
+    """Return one dict per cashback offer found in the email body."""
+    body = _normalize(body)
+    gmail_url = f'https://mail.google.com/mail/u/0/#all/{thread_id}'
+    received_str = received.strftime('%b %d, %Y  %H:%M UTC')
+    seen: set[tuple] = set()
+    results = []
+
+    def add(cashback_num: float, label: str, store: str) -> None:
+        store = _clean_store(store)
+        key = (store.lower(), round(cashback_num, 2))
+        if len(store) < 3 or len(store) > 44 or key in seen:
+            return
+        seen.add(key)
+        results.append({
+            'Store':        store,
+            'Cashback':     label,
+            'Cashback_num': cashback_num,
+            'Received':     received_str,
+            'Received_dt':  received,
+            'Email':        gmail_url,
+        })
+
+    for m in _BODY_PCT_RE.finditer(body):
+        num = float(m.group(1))
+        pre = body[max(0, m.start() - 15): m.start()]
+        prefix = 'Up to ' if re.search(r'up\s+to\s*$', pre, re.IGNORECASE) else ''
+        add(num, f"{prefix}{m.group(1)}%", m.group(2).strip())
+
+    for m in _BODY_DOLLAR_RE.finditer(body):
+        add(float(m.group(1)), f"Up to ${m.group(1)} back", m.group(2).strip())
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main fetch function
 # ---------------------------------------------------------------------------
 
 def fetch_capital_one_offers(
-    days: int = 7,
+    days: int = 3,
     credentials_path: str = 'credentials.json',
     token_path: str = 'token.json',
 ) -> list[dict]:
@@ -231,14 +259,13 @@ def fetch_capital_one_offers(
     ).execute()
     threads = results.get('threads', [])
 
-    offers = []
+    all_offers: list[dict] = []
     for thread in threads:
         thread_id = thread['id']
         data = service.users().threads().get(
             userId='me',
             id=thread_id,
-            format='metadata',
-            metadataHeaders=['Subject', 'From', 'Date'],
+            format='full',
         ).execute()
 
         messages = data.get('messages', [])
@@ -246,26 +273,13 @@ def fetch_capital_one_offers(
             continue
 
         msg = messages[0]
-        headers = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
-        snippet = msg.get('snippet', '')
-        subject = headers.get('Subject', '')
+        headers = {h['name']: h['value']
+                   for h in msg.get('payload', {}).get('headers', [])}
         received = _parse_date(headers.get('Date', ''))
 
-        offer_type = classify_type(subject, snippet)
-        cashback_num, cashback_label = extract_cashback(subject, snippet)
-        store = extract_store(subject, snippet)
-        expiry = extract_expiry(snippet)
+        body = _decode_payload(msg.get('payload', {}))
+        if body:
+            all_offers.extend(_extract_offers_from_body(body, received, thread_id))
 
-        offers.append({
-            'Store':        store,
-            'Cashback':     cashback_label,
-            'Cashback_num': cashback_num,
-            'Type':         TYPE_LABELS.get(offer_type, offer_type),
-            'Expiry':       expiry,
-            'Received':     received.strftime('%b %d, %Y  %H:%M UTC'),
-            'Received_dt':  received,
-            'Email':        f'https://mail.google.com/mail/u/0/#all/{thread_id}',
-        })
-
-    offers.sort(key=lambda x: (-x['Cashback_num'], x['Store'].lower()))
-    return offers
+    all_offers.sort(key=lambda x: (-x['Cashback_num'], x['Store'].lower()))
+    return all_offers
