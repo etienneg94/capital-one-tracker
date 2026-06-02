@@ -1,7 +1,7 @@
 import os
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from gmail_client import fetch_capital_one_offers, TYPE_LABELS
 
@@ -21,10 +21,8 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-/* Tighter top padding */
 .block-container { padding-top: 1.5rem !important; }
 
-/* Metric cards */
 [data-testid="metric-container"] {
     background: #f7f9ff;
     border: 1px solid #dde6f5;
@@ -32,7 +30,6 @@ st.markdown("""
     padding: 12px 16px;
 }
 
-/* Refresh button */
 div[data-testid="column"]:last-child .stButton > button {
     background: #0a3166;
     color: white;
@@ -56,20 +53,17 @@ if 'last_refreshed' not in st.session_state:
 if 'error' not in st.session_state:
     st.session_state.error = None
 
-# ---------------------------------------------------------------------------
-# Credentials path (resolve relative to app directory)
-# ---------------------------------------------------------------------------
-
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_DIR    = os.path.dirname(os.path.abspath(__file__))
 CREDS_PATH = os.path.join(APP_DIR, 'credentials.json')
 TOKEN_PATH = os.path.join(APP_DIR, 'token.json')
 
 
-def load_data():
+def load_data(days: int = 7):
     try:
         st.session_state.offers = fetch_capital_one_offers(
             credentials_path=CREDS_PATH,
             token_path=TOKEN_PATH,
+            days=days,
         )
         st.session_state.last_refreshed = datetime.now()
         st.session_state.error = None
@@ -89,14 +83,14 @@ with col_title:
     if st.session_state.last_refreshed:
         st.caption(f"Last refreshed: **{st.session_state.last_refreshed.strftime('%b %d, %Y · %H:%M')}**")
     else:
-        st.caption("Emails from hello@capitaloneshopping.com · Last 7 days")
+        st.caption("Emails from hello@capitaloneshopping.com")
 
 with col_refresh:
-    st.write("")  # vertical spacing
+    st.write("")
     st.write("")
     if st.button("🔄 Refresh", use_container_width=True, type="primary"):
         with st.spinner("Fetching latest offers from Gmail…"):
-            load_data()
+            load_data(days=st.session_state.get('days_window', 7))
         if not st.session_state.error:
             st.success(f"Loaded {len(st.session_state.offers)} offers!", icon="✅")
 
@@ -111,7 +105,7 @@ if st.session_state.offers is None and st.session_state.error is None:
         load_data()
 
 # ---------------------------------------------------------------------------
-# Credentials error — show setup guide
+# Credentials error
 # ---------------------------------------------------------------------------
 
 if st.session_state.error == 'no_credentials':
@@ -138,41 +132,87 @@ elif st.session_state.error:
 
 offers = st.session_state.offers or []
 if not offers:
-    st.info("No offers found in the last 7 days. Try clicking Refresh.")
+    st.info("No offers found. Try clicking Refresh.")
     st.stop()
+
+# ---------------------------------------------------------------------------
+# Build dataframe + deduplication
+# ---------------------------------------------------------------------------
+
+df = pd.DataFrame(offers)
+now_utc = datetime.now(timezone.utc)
+
+# Stores with at least one email in the last 24 h
+new_stores = set(
+    df[df['Received_dt'] >= now_utc - timedelta(hours=24)]['Store'].unique()
+)
+
+# Email count per store (before deduplication)
+store_counts = df.groupby('Store').size().rename('Emails')
+
+# Keep only the best (highest cashback) row per store
+df_deduped = (
+    df.sort_values('Cashback_num', ascending=False)
+      .groupby('Store', sort=False)
+      .first()
+      .reset_index()
+      .join(store_counts, on='Store')
+)
+
+# Prepend 🆕 to stores with a recent email
+df_deduped['Store_display'] = df_deduped['Store'].apply(
+    lambda s: f"🆕 {s}" if s in new_stores else s
+)
 
 # ---------------------------------------------------------------------------
 # Stats bar
 # ---------------------------------------------------------------------------
 
-df = pd.DataFrame(offers)
-top_idx = df['Cashback_num'].idxmax()
-top_cb = df.loc[top_idx, 'Cashback_num']
-top_store = df.loc[top_idx, 'Store']
-c1, c2, c3 = st.columns(3)
-c1.metric("Total Offers", len(df))
-c2.metric("Top Cashback", f"{top_cb}%", delta=top_store)
-c3.metric("Stores", df['Store'].nunique())
+top_idx   = df_deduped['Cashback_num'].idxmax()
+top_cb    = df_deduped.loc[top_idx, 'Cashback_num']
+top_store = df_deduped.loc[top_idx, 'Store']
+new_count = len(new_stores)
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Stores", len(df_deduped))
+c2.metric("Total Emails", len(df))
+c3.metric("Top Cashback", f"{top_cb}%", delta=top_store)
+c4.metric("New (24 h)", new_count)
 
 st.write("")
 
 # ---------------------------------------------------------------------------
-# Filters
+# Controls row: time window + store filter + search + CSV
 # ---------------------------------------------------------------------------
 
-fc1, fc2 = st.columns([2, 2])
+ctl1, ctl2, ctl3, ctl4 = st.columns([2, 2, 2, 1])
 
-with fc1:
-    store_opts = ["All stores"] + sorted(df['Store'].unique().tolist())
-    store_filter = st.selectbox("Store", store_opts, label_visibility="collapsed",
-                                 placeholder="Filter by store…")
+with ctl1:
+    days_window = st.select_slider(
+        "Window", options=[7, 14, 30],
+        value=st.session_state.get('days_window', 7),
+        format_func=lambda x: f"Last {x} days",
+        label_visibility="collapsed",
+    )
+    if days_window != st.session_state.get('days_window', 7):
+        st.session_state['days_window'] = days_window
+        with st.spinner(f"Fetching last {days_window} days…"):
+            load_data(days=days_window)
+        st.rerun()
 
-with fc2:
+with ctl2:
+    store_opts = ["All stores"] + sorted(df_deduped['Store'].unique().tolist())
+    store_filter = st.selectbox("Store", store_opts, label_visibility="collapsed")
+
+with ctl3:
     search = st.text_input("Search", placeholder="🔍  Search store or offer…",
-                            label_visibility="collapsed")
+                           label_visibility="collapsed")
 
-# Apply filters
-filtered = df.copy()
+# ---------------------------------------------------------------------------
+# Filter
+# ---------------------------------------------------------------------------
+
+filtered = df_deduped.copy()
 if store_filter != "All stores":
     filtered = filtered[filtered['Store'] == store_filter]
 if search:
@@ -181,14 +221,23 @@ if search:
     )
     filtered = filtered[mask]
 
-st.caption(f"Showing **{len(filtered)}** of {len(df)} offers")
+with ctl4:
+    csv_bytes = filtered[['Store', 'Cashback', 'Emails', 'Received', 'Email']].to_csv(index=False).encode()
+    st.download_button(
+        "⬇️ CSV",
+        data=csv_bytes,
+        file_name=f"capital_one_offers_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+st.caption(f"Showing **{len(filtered)}** stores · {int(filtered['Emails'].sum())} emails")
 
 # ---------------------------------------------------------------------------
 # Table
 # ---------------------------------------------------------------------------
 
-display_cols = ['Store', 'Cashback', 'Received', 'Email']
-display = filtered[display_cols].reset_index(drop=True)
+display = filtered[['Store_display', 'Cashback', 'Emails', 'Received', 'Email']].reset_index(drop=True)
 
 st.dataframe(
     display,
@@ -196,15 +245,16 @@ st.dataframe(
     hide_index=True,
     height=min(60 + len(display) * 38, 700),
     column_config={
-        'Store':    st.column_config.TextColumn("Store",          width=200),
-        'Cashback': st.column_config.TextColumn("Cashback %",     width=200),
-        'Received': st.column_config.TextColumn("Received (UTC)", width=220),
-        'Email':    st.column_config.LinkColumn(
-                        "Open Email",
-                        display_text="✉ View",
-                        width=120,
-                    ),
+        'Store_display': st.column_config.TextColumn("Store",          width=200),
+        'Cashback':      st.column_config.TextColumn("Cashback %",     width=180),
+        'Emails':        st.column_config.NumberColumn("Emails",       width=90,  format="%d"),
+        'Received':      st.column_config.TextColumn("Best Offer Received (UTC)", width=220),
+        'Email':         st.column_config.LinkColumn(
+                             "Open Email",
+                             display_text="✉ View",
+                             width=110,
+                         ),
     },
 )
 
-st.caption("Click any column header to sort. Click ✉ View to open the email in Gmail.")
+st.caption("Deduplicated by store — showing best cashback per store. Click any header to sort.")
