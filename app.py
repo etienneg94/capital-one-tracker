@@ -58,7 +58,7 @@ CREDS_PATH = os.path.join(APP_DIR, 'credentials.json')
 TOKEN_PATH = os.path.join(APP_DIR, 'token.json')
 
 
-def load_data(days: int = 7):
+def load_data(days: int = 3):
     try:
         st.session_state.offers = fetch_capital_one_offers(
             credentials_path=CREDS_PATH,
@@ -189,12 +189,12 @@ ctl1, ctl2, ctl3, ctl4 = st.columns([2, 2, 2, 1])
 
 with ctl1:
     days_window = st.select_slider(
-        "Window", options=[7, 14, 30],
-        value=st.session_state.get('days_window', 7),
+        "Window", options=[3, 7, 14, 30],
+        value=st.session_state.get('days_window', 3),
         format_func=lambda x: f"Last {x} days",
         label_visibility="collapsed",
     )
-    if days_window != st.session_state.get('days_window', 7):
+    if days_window != st.session_state.get('days_window', 3):
         st.session_state['days_window'] = days_window
         with st.spinner(f"Fetching last {days_window} days…"):
             load_data(days=days_window)
@@ -237,7 +237,7 @@ st.caption(f"Showing **{len(filtered)}** stores · {int(filtered['Emails'].sum()
 # Table
 # ---------------------------------------------------------------------------
 
-display = filtered[['Store_display', 'Cashback', 'Emails', 'Received', 'Email']].reset_index(drop=True)
+display = filtered[['Store_display', 'Cashback_num', 'Cashback', 'Emails', 'Received', 'Email']].reset_index(drop=True)
 
 st.dataframe(
     display,
@@ -245,10 +245,11 @@ st.dataframe(
     hide_index=True,
     height=min(60 + len(display) * 38, 700),
     column_config={
-        'Store_display': st.column_config.TextColumn("Store",          width=200),
-        'Cashback':      st.column_config.TextColumn("Cashback %",     width=180),
-        'Emails':        st.column_config.NumberColumn("Emails",       width=90,  format="%d"),
-        'Received':      st.column_config.TextColumn("Best Offer Received (UTC)", width=220),
+        'Store_display': st.column_config.TextColumn("Store",      width=200),
+        'Cashback_num':  st.column_config.NumberColumn("Cashback %", width=120, format="%.4g%%"),
+        'Cashback':      None,
+        'Emails':        st.column_config.NumberColumn("Emails",   width=90,  format="%d"),
+        'Received':      st.column_config.TextColumn("Received (UTC)", width=210),
         'Email':         st.column_config.LinkColumn(
                              "Open Email",
                              display_text="✉ View",

@@ -84,52 +84,43 @@ def get_gmail_service(credentials_path='credentials.json', token_path='token.jso
 # ---------------------------------------------------------------------------
 
 def extract_store(subject: str, snippet: str) -> str:
-    """Extract retailer name. Snippet 'at {STORE}' patterns are most reliable."""
+    """Extract retailer name. Tries patterns from most to least reliable."""
 
-    # Snippet: "Earn X% in Rewards, Up to $1000 at {STORE}." / "Earn X% back at {STORE}"
-    m = re.search(
-        r'(?:Earn|Get)\s+(?:up\s+to\s+)?[\$\d][\d,\.]*\s*%?.*?\bat\s+([\w][\w\s&\.\-\']*?)(?:\s*\.|,|\s+You\s|\s+Get\s|\s*$)',
-        snippet, re.IGNORECASE
-    )
-    if m:
-        store = m.group(1).strip()
-        if 3 < len(store) < 45:
-            return _clean_store(store)
+    # --- Snippet patterns ---
+    snippet_pats = [
+        # "Up to $1000 at {STORE}."  (very common in Capital One snippets)
+        r'Up to \$[\d,]+\s+at\s+([\w][\w\s&\.\'\-]+?)(?:\.|,|\s+You|\s+Get)',
+        # "Earn X% back at {STORE}" / "Earn X% in Rewards ... at {STORE}"
+        r'(?:Earn|Get)\s+(?:up\s+to\s+)?[\$\d][\d,\.]*\s*%?\s+(?:back|in\s+Rewards|Rewards)\s+(?:too\s+)?at\s+([\w][\w\s&\.\'\-]+?)(?:\.|,|\s+You|\s+Get)',
+        r'(?:Earn|Get)\s+(?:up\s+to\s+)?[\$\d][\d,\.]*\s*%?.*?\bat\s+([\w][\w\s&\.\'\-]+?)(?:\.|,|\s+You\s|\s+Get\s)',
+        # "back at {STORE}" / "Rewards at {STORE}"
+        r'(?:back|Rewards?)\s+at\s+([\w][\w\s&\.\'\-]+?)(?:\.|,|\s+You|\s+Get)',
+    ]
+    for pat in snippet_pats:
+        m = re.search(pat, snippet, re.IGNORECASE)
+        if m:
+            s = _clean_store(m.group(1))
+            if 2 < len(s) < 45:
+                return s
 
-    # Subject: "Offer at {STORE} for you!"
-    m = re.search(r'[Oo]ffer\s+at\s+(.+?)\s+for\s+you', subject, re.IGNORECASE)
-    if m:
-        return _clean_store(m.group(1))
-
-    # Subject: "Your X% Reward at {STORE}"
-    m = re.search(r'[Yy]our\s+[\d\.]+%.*?\bat\s+(.+?)(?:[!,]|$)', subject)
-    if m:
-        return _clean_store(m.group(1))
-
-    # Subject: "Expiring soon: X% back at {STORE}!"
-    m = re.search(r'[Ee]xpiring\s+soon:.*?\bat\s+(.+?)(?:[!,]|$)', subject)
-    if m:
-        return _clean_store(m.group(1))
-
-    # Subject: "New Rewards Offer: ... at {STORE}!"
-    m = re.search(r'[Nn]ew Rewards Offer:.*?\bat\s+(.+?)(?:[!,]|$)', subject)
-    if m:
-        return _clean_store(m.group(1))
-
-    # Subject: "Offer alert: ... at {STORE}[,!]"
-    m = re.search(r'[Oo]ffer\s+alert:.*?\bat\s+([\w][\w\s&\.\-]+?)(?:[,!]|$)', subject)
-    if m:
-        return _clean_store(m.group(1))
-
-    # Subject: "{STORE} Offer: ..."
-    m = re.search(r'^([\w][\w\s&\.\-]+?)\s+Offer:', subject)
-    if m:
-        return _clean_store(m.group(1))
-
-    # Subject: "- {STORE}.com!" or "| {STORE}!" at end
-    m = re.search(r'[-|]\s+([\w][\w\s&\.\-]+?)(?:\.com)?[!]?\s*$', subject)
-    if m:
-        return _clean_store(m.group(1))
+    # --- Subject patterns ---
+    subject_pats = [
+        r'[Oo]ffer\s+at\s+(.+?)\s+for\s+you',                         # "Offer at {STORE} for you"
+        r'[Yy]our\s+[\d\.]+%.*?\bat\s+(.+?)(?:[!,]|$)',               # "Your X% Reward at {STORE}"
+        r'[Ee]xpiring\s+soon:.*?\bat\s+(.+?)(?:[!,]|$)',              # "Expiring soon: ... at {STORE}"
+        r'[Nn]ew\s+[Rr]ewards\s+[Oo]ffer:.*?\bat\s+(.+?)(?:[!,]|$)', # "New Rewards Offer: at {STORE}"
+        r'[Oo]ffer\s+alert:.*?\bat\s+([\w][\w\s&\.\'\-]+?)(?:[,!]|$)',# "Offer alert: ... at {STORE}"
+        r'^([\w][\w\s&\.\'\-]+?)\s+[Oo]ffer:',                        # "{STORE} Offer: ..."
+        r'[Ss]ave\s+on\s+.+?\bat\s+([\w][\w\s&\.\'\-]+?)(?:[,!]|$)', # "Save on X at {STORE}"
+        r'[-|]\s+([\w][\w\s&\.\'\-]+?)(?:\.com)?[!]?\s*$',            # "- QVC.com!" at end
+        r'\bat\s+([\w][\w\s&\.\'\-]{2,30}?)(?:[!,\.]|$)',             # broad fallback: "at {STORE}"
+    ]
+    for pat in subject_pats:
+        m = re.search(pat, subject, re.IGNORECASE)
+        if m:
+            s = _clean_store(m.group(1))
+            if 2 < len(s) < 45:
+                return s
 
     return 'Unknown'
 
