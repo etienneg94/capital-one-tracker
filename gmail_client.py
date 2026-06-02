@@ -204,32 +204,49 @@ def get_body(payload: dict) -> str:
 # Multi-offer extraction from body
 # ---------------------------------------------------------------------------
 
-# Stores that appear as branding noise in every Capital One email
+# Stores/phrases that appear as branding noise in every Capital One email
 _SKIP_STORES = {'capital one', 'capital one shopping', 'shopping'}
 
-# "Earn X% in Rewards ... at {STORE}"  (Activate-Rewards style)
-_AT_STORE_RE = re.compile(
-    r'(?:Earn|Get)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%'
-    r'\s*(?:in\s+Rewards?|back|Rewards?).{0,120}?'
-    r'\bat\s+([\w][\w\s&\.\'\-]{2,38}?)(?=\.|,|\s+You\s|\s+Up\s|\s+Get\s|\s+Activate|\n|$)',
-    re.IGNORECASE | re.DOTALL,
+# Section headers that mark the start of low-quality / generic offers to ignore
+_SECTION_CUTOFFS = re.compile(
+    r"today'?s?\s+top\s+deals|more\s+ways\s+to\s+earn|you\s+might\s+also\s+like|"
+    r"featured\s+offers|popular\s+stores|browse\s+more",
+    re.IGNORECASE,
+)
+
+# Pass 1 — find every cashback percentage in the body
+_PCT_VALUE_RE = re.compile(
+    r'(?:Earn|Get)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%\s*(?:in\s+Rewards?|back|Rewards?)',
+    re.IGNORECASE,
+)
+
+# Pass 2 — find every "at {STORE}" anchor
+_AT_ANCHOR_RE = re.compile(
+    r'\bat\s+([\w][\w &\.\'\-]{2,38}?)(?=\s*[.,]|\s+(?:You|Up|Get|Activate|Earn|Shop|We|\n)|$)',
+    re.IGNORECASE,
 )
 
 # "Earn $X in Rewards at {STORE}"
 _DOLLAR_AT_RE = re.compile(
     r'(?:Earn|Get)\s+(?:up\s+to\s+)?\$(\d+(?:\.\d+)?)'
-    r'\s+(?:in\s+)?Rewards?\s+at\s+([\w][\w\s&\.\'\-]{2,38}?)(?=\.|,|\s+You\s|\s+Get\s|\n|$)',
+    r'\s+(?:in\s+)?Rewards?\s+at\s+([\w][\w &\.\'\-]{2,38}?)(?=\.|,|\s+You\s|\s+Get\s|\n|$)',
     re.IGNORECASE,
 )
 
-# "Earn X% back / in Rewards / Rewards too" (store name was before the URL)
+# "Earn X% back" for logo-preceded single-store emails (plain text format)
 _PCT_BACK_RE = re.compile(
     r'(?:Earn|Get)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%\s*(?:back|in\s+Rewards?|Rewards?)',
     re.IGNORECASE,
 )
 
-# "{Store Name} logo"  — use literal space (not \s) to prevent cross-line/sentence matches
+# "{Store Name} logo"
 _LOGO_RE = re.compile(r'([A-Z][\w &\'\-]{1,38}?)\s+logo\b', re.IGNORECASE)
+
+# Generic non-store phrases to reject as store names
+_GENERIC_PHRASES = {
+    'hotel', 'hotels', 'hotel bookings', 'event tickets', 'events',
+    'travel', 'flights', 'car rentals', 'gift cards',
+}
 
 
 def _collapse_urls(text: str) -> str:
@@ -244,8 +261,14 @@ def _collapse_urls(text: str) -> str:
 def _extract_offers_from_body(body: str, received: datetime, thread_id: str) -> list[dict]:
     """Return one dict per cashback offer found in the email body."""
     body = _normalize(body)
-    body = _collapse_urls(body)         # shrink JWT-bearing URLs to [URL]
-    gmail_url = f'https://mail.google.com/mail/u/0/#all/{thread_id}'
+    body = _collapse_urls(body)
+
+    # Truncate at section headers that introduce generic/low-quality offers
+    cutoff = _SECTION_CUTOFFS.search(body)
+    if cutoff:
+        body = body[:cutoff.start()]
+
+    gmail_url   = f'https://mail.google.com/mail/u/0/#all/{thread_id}'
     received_str = received.strftime('%b %d, %Y  %H:%M UTC')
     seen: set[tuple] = set()
     results = []
@@ -260,6 +283,10 @@ def _extract_offers_from_body(body: str, received: datetime, thread_id: str) -> 
             return
         if 'capital one' in store.lower() or store.lower() in _SKIP_STORES:
             return
+        if store.lower() in _GENERIC_PHRASES:
+            return
+        if cashback_num <= 0 or cashback_num > 100:
+            return
         key = (store.lower(), round(cashback_num, 2))
         if key in seen:
             return
@@ -273,10 +300,34 @@ def _extract_offers_from_body(body: str, received: datetime, thread_id: str) -> 
             'Email':        gmail_url,
         })
 
-    # --- Strategy A: "{Store} logo … Earn X% back" ---
-    # Handles Offer-Alert emails where the store name PRECEDES the cashback.
-    # After URL collapsing, "{Store} logo [URL] Earn X% back" is short enough
-    # to match in a 300-char window.
+    # -----------------------------------------------------------------------
+    # Strategy A — two-pass pairing (handles variable gap between % and store)
+    #
+    # Single-regex "Earn X%...{gap}...at {STORE}" breaks when the gap in the
+    # stripped HTML exceeds the window size and the regex skips to the NEXT
+    # "at {STORE}" block (wrong store). Two-pass solves this:
+    #   Pass 1: record every "Earn X%" position
+    #   Pass 2: record every "at {STORE}" position
+    #   Pair: each % → nearest following store anchor
+    # -----------------------------------------------------------------------
+    pct_hits   = [(m.start(), m.end(), float(m.group(1)))
+                  for m in _PCT_VALUE_RE.finditer(body)]
+    store_hits = [(m.start(), _clean_store(m.group(1).strip()))
+                  for m in _AT_ANCHOR_RE.finditer(body)]
+
+    for pct_start, pct_end, num in pct_hits:
+        # Nearest "at {STORE}" that starts AFTER this % token
+        following = [(s, name) for s, name in store_hits if s >= pct_end]
+        if not following:
+            continue
+        _, store = min(following, key=lambda x: x[0])
+        pre = body[max(0, pct_start - 15): pct_start]
+        add(num, _pct_label(num, pre), store)
+
+    # -----------------------------------------------------------------------
+    # Strategy B — logo-preceded single-store emails (plain text format)
+    # "{Store} logo [URL] Earn X% back"
+    # -----------------------------------------------------------------------
     for logo_m in _LOGO_RE.finditer(body):
         store_candidate = logo_m.group(1).strip()
         if 'capital one' in store_candidate.lower():
@@ -285,19 +336,12 @@ def _extract_offers_from_body(body: str, received: datetime, thread_id: str) -> 
         pct_m = _PCT_BACK_RE.search(window)
         if pct_m:
             num = float(pct_m.group(1))
-            if num > 100:          # sanity check: not a real cashback %
-                continue
             pre = window[:pct_m.start()]
             add(num, _pct_label(num, pre), store_candidate)
 
-    # --- Strategy B: "Earn X% … at {STORE}" ---
-    # Handles Activate-Rewards emails where the store name FOLLOWS the cashback.
-    for m in _AT_STORE_RE.finditer(body):
-        num = float(m.group(1))
-        pre = body[max(0, m.start() - 15): m.start()]
-        add(num, _pct_label(num, pre), m.group(2).strip())
-
-    # --- Strategy C: "Earn $X in Rewards at {STORE}" ---
+    # -----------------------------------------------------------------------
+    # Strategy C — "Earn $X in Rewards at {STORE}"
+    # -----------------------------------------------------------------------
     for m in _DOLLAR_AT_RE.finditer(body):
         add(float(m.group(1)), f"Up to ${m.group(1)} back", m.group(2).strip())
 
