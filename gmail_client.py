@@ -194,33 +194,64 @@ def _decode_payload(payload: dict) -> str:
 # Multi-offer extraction from body
 # ---------------------------------------------------------------------------
 
-# Patterns that yield (cashback_num_group, label_suffix, store_group)
-_BODY_PCT_RE = re.compile(
+# Stores that appear as branding noise in every Capital One email
+_SKIP_STORES = {'capital one', 'capital one shopping', 'shopping'}
+
+# "Earn X% in Rewards ... at {STORE}"  (Activate-Rewards style)
+_AT_STORE_RE = re.compile(
     r'(?:Earn|Get)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%'
-    r'\s*(?:in\s+Rewards?|back|Rewards?).{0,80}?'
+    r'\s*(?:in\s+Rewards?|back|Rewards?).{0,120}?'
     r'\bat\s+([\w][\w\s&\.\'\-]{2,38}?)(?=\.|,|\s+You\s|\s+Up\s|\s+Get\s|\s+Activate|\n|$)',
     re.IGNORECASE | re.DOTALL,
 )
 
-_BODY_DOLLAR_RE = re.compile(
+# "Earn $X in Rewards at {STORE}"
+_DOLLAR_AT_RE = re.compile(
     r'(?:Earn|Get)\s+(?:up\s+to\s+)?\$(\d+(?:\.\d+)?)'
     r'\s+(?:in\s+)?Rewards?\s+at\s+([\w][\w\s&\.\'\-]{2,38}?)(?=\.|,|\s+You\s|\s+Get\s|\n|$)',
     re.IGNORECASE,
 )
 
+# "Earn X% back"  (no "at STORE" — store name was before the URL)
+_PCT_BACK_RE = re.compile(
+    r'(?:Earn|Get)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%\s*(?:back|in\s+Rewards?)',
+    re.IGNORECASE,
+)
+
+# "{Store Name} logo"  — use literal space (not \s) to prevent cross-line/sentence matches
+_LOGO_RE = re.compile(r'([A-Z][\w &\'\-]{1,38}?)\s+logo\b', re.IGNORECASE)
+
+
+def _collapse_urls(text: str) -> str:
+    """Replace long URLs with a short placeholder so proximity matching works.
+
+    Capital One redirect URLs contain JWT tokens (500-1000 chars) that sit
+    between '{Store} logo' and 'Earn X% back', breaking window-based search.
+    """
+    return re.sub(r'https?://\S{30,}', '[URL]', text)
+
 
 def _extract_offers_from_body(body: str, received: datetime, thread_id: str) -> list[dict]:
     """Return one dict per cashback offer found in the email body."""
     body = _normalize(body)
+    body = _collapse_urls(body)         # shrink JWT-bearing URLs to [URL]
     gmail_url = f'https://mail.google.com/mail/u/0/#all/{thread_id}'
     received_str = received.strftime('%b %d, %Y  %H:%M UTC')
     seen: set[tuple] = set()
     results = []
 
+    def _pct_label(num: float, pre_text: str) -> str:
+        prefix = 'Up to ' if re.search(r'up\s+to\s*$', pre_text.strip(), re.IGNORECASE) else ''
+        return f"{prefix}{num:g}%"
+
     def add(cashback_num: float, label: str, store: str) -> None:
         store = _clean_store(store)
+        if len(store) < 3 or len(store) > 44:
+            return
+        if 'capital one' in store.lower() or store.lower() in _SKIP_STORES:
+            return
         key = (store.lower(), round(cashback_num, 2))
-        if len(store) < 3 or len(store) > 44 or key in seen:
+        if key in seen:
             return
         seen.add(key)
         results.append({
@@ -232,13 +263,30 @@ def _extract_offers_from_body(body: str, received: datetime, thread_id: str) -> 
             'Email':        gmail_url,
         })
 
-    for m in _BODY_PCT_RE.finditer(body):
+    # --- Strategy A: "{Store} logo … Earn X% back" ---
+    # Handles Offer-Alert emails where the store name PRECEDES the cashback.
+    # After URL collapsing, "{Store} logo [URL] Earn X% back" is short enough
+    # to match in a 300-char window.
+    for logo_m in _LOGO_RE.finditer(body):
+        store_candidate = logo_m.group(1).strip()
+        if 'capital one' in store_candidate.lower():
+            continue
+        window = body[logo_m.end(): logo_m.end() + 300]
+        pct_m = _PCT_BACK_RE.search(window)
+        if pct_m:
+            num = float(pct_m.group(1))
+            pre = window[:pct_m.start()]
+            add(num, _pct_label(num, pre), store_candidate)
+
+    # --- Strategy B: "Earn X% … at {STORE}" ---
+    # Handles Activate-Rewards emails where the store name FOLLOWS the cashback.
+    for m in _AT_STORE_RE.finditer(body):
         num = float(m.group(1))
         pre = body[max(0, m.start() - 15): m.start()]
-        prefix = 'Up to ' if re.search(r'up\s+to\s*$', pre, re.IGNORECASE) else ''
-        add(num, f"{prefix}{m.group(1)}%", m.group(2).strip())
+        add(num, _pct_label(num, pre), m.group(2).strip())
 
-    for m in _BODY_DOLLAR_RE.finditer(body):
+    # --- Strategy C: "Earn $X in Rewards at {STORE}" ---
+    for m in _DOLLAR_AT_RE.finditer(body):
         add(float(m.group(1)), f"Up to ${m.group(1)} back", m.group(2).strip())
 
     return results
