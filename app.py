@@ -5,6 +5,8 @@ from datetime import datetime, timezone, timedelta
 
 from gmail_client import fetch_capital_one_offers, TYPE_LABELS
 
+DEBUG = os.environ.get('CO_DEBUG', '').lower() in ('1', 'true')
+
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
@@ -60,11 +62,16 @@ TOKEN_PATH = os.path.join(APP_DIR, 'token.json')
 
 def load_data(days: int = 3):
     try:
-        st.session_state.offers = fetch_capital_one_offers(
+        result = fetch_capital_one_offers(
             credentials_path=CREDS_PATH,
             token_path=TOKEN_PATH,
             days=days,
+            debug=DEBUG,
         )
+        if DEBUG:
+            st.session_state.offers, st.session_state.debug_samples = result
+        else:
+            st.session_state.offers = result
         st.session_state.last_refreshed = datetime.now()
         st.session_state.error = None
     except FileNotFoundError:
@@ -134,6 +141,18 @@ offers = st.session_state.offers or []
 if not offers:
     st.info("No offers found. Try clicking Refresh.")
     st.stop()
+
+# ---------------------------------------------------------------------------
+# Debug panel (enabled via CO_DEBUG=1 env var)
+# ---------------------------------------------------------------------------
+
+if DEBUG and st.session_state.get('debug_samples'):
+    with st.expander("🐛 Debug — first 3 email bodies + matches", expanded=True):
+        for i, s in enumerate(st.session_state.debug_samples):
+            st.markdown(f"**Email {i+1}:** `{s['subject']}`")
+            st.markdown(f"**Offers found:** {s['offers_found'] or 'NONE'}")
+            st.code(s['body_snippet'], language=None)
+            st.divider()
 
 # ---------------------------------------------------------------------------
 # Build dataframe + deduplication

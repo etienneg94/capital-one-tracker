@@ -252,7 +252,9 @@ def fetch_capital_one_offers(
     days: int = 3,
     credentials_path: str = 'credentials.json',
     token_path: str = 'token.json',
-) -> list[dict]:
+    debug: bool = False,
+) -> list[dict] | tuple[list[dict], list[dict]]:
+    """Fetch offers. If debug=True, also return raw body samples for inspection."""
     service = get_gmail_service(credentials_path, token_path)
 
     query = f'from:{SENDER} newer_than:{days}d'
@@ -262,6 +264,8 @@ def fetch_capital_one_offers(
     threads = results.get('threads', [])
 
     all_offers: list[dict] = []
+    debug_samples: list[dict] = []
+
     for thread in threads:
         thread_id = thread['id']
         data = service.users().threads().get(
@@ -281,7 +285,16 @@ def fetch_capital_one_offers(
 
         body = _decode_payload(msg.get('payload', {}))
         if body:
-            all_offers.extend(_extract_offers_from_body(body, received, thread_id))
+            offers = _extract_offers_from_body(body, received, thread_id)
+            all_offers.extend(offers)
+            if debug and len(debug_samples) < 3:
+                debug_samples.append({
+                    'subject': headers.get('Subject', ''),
+                    'body_snippet': body[:2000],
+                    'offers_found': [o['Store'] + ' ' + o['Cashback'] for o in offers],
+                })
 
     all_offers.sort(key=lambda x: (-x['Cashback_num'], x['Store'].lower()))
+    if debug:
+        return all_offers, debug_samples
     return all_offers
