@@ -83,8 +83,19 @@ def get_gmail_service(credentials_path='credentials.json', token_path='token.jso
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
+def _normalize(text: str) -> str:
+    """Replace Unicode lookalike punctuation Capital One uses in email subjects."""
+    return (text
+            .replace('․', '.')   # ONE DOT LEADER → period  (e.g. QVC․com)
+            .replace('·', '.')   # MIDDLE DOT → period
+            .replace('’', "'")   # RIGHT SINGLE QUOTATION → apostrophe
+            .replace('‘', "'"))  # LEFT SINGLE QUOTATION → apostrophe
+
+
 def extract_store(subject: str, snippet: str) -> str:
     """Extract retailer name. Tries patterns from most to least reliable."""
+    subject = _normalize(subject)
+    snippet = _normalize(snippet)
 
     # --- Snippet patterns ---
     snippet_pats = [
@@ -133,7 +144,7 @@ def _clean_store(name: str) -> str:
 
 def extract_cashback(subject: str, snippet: str) -> tuple[float, str]:
     """Return (numeric_value_for_sorting, display_label)."""
-    combined = snippet + ' ' + subject
+    combined = _normalize(snippet + ' ' + subject)
 
     # Price drop amount
     drop_m = re.search(r'Price Drop \$?([\d,]+(?:\.\d+)?)', combined, re.IGNORECASE)
