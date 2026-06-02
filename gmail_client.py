@@ -1,5 +1,6 @@
 """Gmail fetcher + offer parser for Capital One Shopping emails."""
 
+import html
 import json
 import os
 import re
@@ -84,12 +85,13 @@ def get_gmail_service(credentials_path='credentials.json', token_path='token.jso
 # ---------------------------------------------------------------------------
 
 def _normalize(text: str) -> str:
-    """Replace Unicode lookalike punctuation Capital One uses in email subjects."""
+    """Decode HTML entities and replace Unicode lookalike punctuation."""
+    text = html.unescape(text)
     return (text
-            .replace('․', '.')   # ONE DOT LEADER → period  (e.g. QVC․com)
-            .replace('·', '.')   # MIDDLE DOT → period
-            .replace('’', "'")   # RIGHT SINGLE QUOTATION → apostrophe
-            .replace('‘', "'"))  # LEFT SINGLE QUOTATION → apostrophe
+            .replace("․", ".")
+            .replace("·", ".")
+            .replace("’", "'")
+            .replace("‘", "'"))
 
 
 def extract_store(subject: str, snippet: str) -> str:
