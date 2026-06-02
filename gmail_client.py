@@ -222,9 +222,9 @@ _DOLLAR_AT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# "Earn X% back"  (no "at STORE" — store name was before the URL)
+# "Earn X% back / in Rewards / Rewards too" (store name was before the URL)
 _PCT_BACK_RE = re.compile(
-    r'(?:Earn|Get)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%\s*(?:back|in\s+Rewards?)',
+    r'(?:Earn|Get)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%\s*(?:back|in\s+Rewards?|Rewards?)',
     re.IGNORECASE,
 )
 
@@ -285,6 +285,8 @@ def _extract_offers_from_body(body: str, received: datetime, thread_id: str) -> 
         pct_m = _PCT_BACK_RE.search(window)
         if pct_m:
             num = float(pct_m.group(1))
+            if num > 100:          # sanity check: not a real cashback %
+                continue
             pre = window[:pct_m.start()]
             add(num, _pct_label(num, pre), store_candidate)
 
