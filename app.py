@@ -150,7 +150,8 @@ if DEBUG and st.session_state.get('debug_samples'):
     with st.expander("🐛 Debug — first 3 email bodies + matches", expanded=True):
         for i, s in enumerate(st.session_state.debug_samples):
             st.markdown(f"**Email {i+1}:** `{s['subject']}`")
-            st.markdown(f"**Offers found:** {s['offers_found'] or 'NONE'}")
+            st.markdown(f"Body used: **{s['body_used']}** — HTML {s['html_len']} chars, plain {s['plain_len']} chars")
+            st.markdown(f"**Offers found:** {s['offers_found'] or 'NONE ⚠️'}")
             st.code(s['body_snippet'], language=None)
             st.divider()
 

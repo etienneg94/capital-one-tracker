@@ -157,37 +157,47 @@ def _parse_date(date_str: str) -> datetime:
 # Body decoding
 # ---------------------------------------------------------------------------
 
-def _decode_payload(payload: dict) -> str:
-    """Recursively extract text from a MIME payload.
+def _strip_html(raw: str) -> str:
+    text = re.sub(r'<[^>]+>', ' ', raw)
+    return re.sub(r'[ \t]+', ' ', text)
 
-    Capital One emails are HTML-only marketing messages — the text/plain
-    alternative is usually just "View this email in your browser".
-    We collect ALL parts and return whichever has the most content so the
-    regex sees the full offer list from the HTML body.
+
+def _decode_payload(payload: dict) -> tuple[str, str]:
+    """Recursively extract (html_text, plain_text) from a MIME payload.
+
+    Returns a tuple so the caller can always prefer HTML — Capital One
+    emails are rich HTML marketing messages. The plain text alternative
+    inflates length with huge JWT URLs, so 'return longest' wrongly
+    picks plain text. Callers should use html_text and fall back to
+    plain_text only when html_text is empty.
     """
     mime = payload.get('mimeType', '')
-
-    if mime == 'text/plain':
-        data = payload.get('body', {}).get('data', '')
-        if data:
-            return base64.urlsafe_b64decode(data + '==').decode('utf-8', errors='ignore')
 
     if mime == 'text/html':
         data = payload.get('body', {}).get('data', '')
         if data:
-            text = base64.urlsafe_b64decode(data + '==').decode('utf-8', errors='ignore')
-            text = re.sub(r'<[^>]+>', ' ', text)   # strip tags
-            text = re.sub(r'[ \t]+', ' ', text)     # collapse whitespace
-            return text
+            raw = base64.urlsafe_b64decode(data + '==').decode('utf-8', errors='ignore')
+            return _strip_html(raw), ''
 
-    # Multipart: collect all parts, return the longest (most content)
-    candidates = []
+    if mime == 'text/plain':
+        data = payload.get('body', {}).get('data', '')
+        if data:
+            return '', base64.urlsafe_b64decode(data + '==').decode('utf-8', errors='ignore')
+
+    # Multipart: recurse and accumulate both types across all parts
+    html_acc, plain_acc = '', ''
     for part in payload.get('parts', []):
-        result = _decode_payload(part)
-        if result:
-            candidates.append(result)
+        h, p = _decode_payload(part)
+        html_acc  += h
+        plain_acc += p
 
-    return max(candidates, key=len) if candidates else ''
+    return html_acc, plain_acc
+
+
+def get_body(payload: dict) -> str:
+    """Return the best body text for offer extraction: HTML first, plain fallback."""
+    html, plain = _decode_payload(payload)
+    return html or plain
 
 
 # ---------------------------------------------------------------------------
@@ -331,14 +341,18 @@ def fetch_capital_one_offers(
                    for h in msg.get('payload', {}).get('headers', [])}
         received = _parse_date(headers.get('Date', ''))
 
-        body = _decode_payload(msg.get('payload', {}))
+        body = get_body(msg.get('payload', {}))
         if body:
             offers = _extract_offers_from_body(body, received, thread_id)
             all_offers.extend(offers)
             if debug and len(debug_samples) < 3:
+                html_raw, plain_raw = _decode_payload(msg.get('payload', {}))
                 debug_samples.append({
-                    'subject': headers.get('Subject', ''),
-                    'body_snippet': body[:2000],
+                    'subject':      headers.get('Subject', ''),
+                    'html_len':     len(html_raw),
+                    'plain_len':    len(plain_raw),
+                    'body_used':    'html' if html_raw else 'plain',
+                    'body_snippet': body[:3000],
                     'offers_found': [o['Store'] + ' ' + o['Cashback'] for o in offers],
                 })
 
