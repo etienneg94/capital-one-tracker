@@ -263,11 +263,6 @@ def _extract_offers_from_body(body: str, received: datetime, thread_id: str) -> 
     body = _normalize(body)
     body = _collapse_urls(body)
 
-    # Truncate at section headers that introduce generic/low-quality offers
-    cutoff = _SECTION_CUTOFFS.search(body)
-    if cutoff:
-        body = body[:cutoff.start()]
-
     gmail_url   = f'https://mail.google.com/mail/u/0/#all/{thread_id}'
     received_str = received.strftime('%b %d, %Y  %H:%M UTC')
     seen: set[tuple] = set()
