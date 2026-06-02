@@ -158,7 +158,13 @@ def _parse_date(date_str: str) -> datetime:
 # ---------------------------------------------------------------------------
 
 def _decode_payload(payload: dict) -> str:
-    """Recursively extract plain text from a MIME payload, preferring text/plain."""
+    """Recursively extract text from a MIME payload.
+
+    Capital One emails are HTML-only marketing messages — the text/plain
+    alternative is usually just "View this email in your browser".
+    We collect ALL parts and return whichever has the most content so the
+    regex sees the full offer list from the HTML body.
+    """
     mime = payload.get('mimeType', '')
 
     if mime == 'text/plain':
@@ -170,22 +176,18 @@ def _decode_payload(payload: dict) -> str:
         data = payload.get('body', {}).get('data', '')
         if data:
             text = base64.urlsafe_b64decode(data + '==').decode('utf-8', errors='ignore')
-            text = re.sub(r'<[^>]+>', ' ', text)
-            text = re.sub(r'[ \t]+', ' ', text)
+            text = re.sub(r'<[^>]+>', ' ', text)   # strip tags
+            text = re.sub(r'[ \t]+', ' ', text)     # collapse whitespace
             return text
 
-    # Multipart: recurse, prefer plain over html
-    plain, fallback = '', ''
+    # Multipart: collect all parts, return the longest (most content)
+    candidates = []
     for part in payload.get('parts', []):
         result = _decode_payload(part)
-        if not result:
-            continue
-        if part.get('mimeType', '').startswith('text/plain'):
-            plain = plain + '\n' + result
-        else:
-            fallback = fallback + '\n' + result
+        if result:
+            candidates.append(result)
 
-    return plain.strip() or fallback.strip()
+    return max(candidates, key=len) if candidates else ''
 
 
 # ---------------------------------------------------------------------------
@@ -195,9 +197,9 @@ def _decode_payload(payload: dict) -> str:
 # Patterns that yield (cashback_num_group, label_suffix, store_group)
 _BODY_PCT_RE = re.compile(
     r'(?:Earn|Get)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%'
-    r'\s*(?:in\s+Rewards?|back|Rewards?)[^@\n]{0,60}?'
-    r'\bat\s+([\w][\w\s&\.\'\-]{2,38}?)(?=\.|,|\s+You\s|\s+Up\s|\s+Get\s|\n|$)',
-    re.IGNORECASE,
+    r'\s*(?:in\s+Rewards?|back|Rewards?).{0,80}?'
+    r'\bat\s+([\w][\w\s&\.\'\-]{2,38}?)(?=\.|,|\s+You\s|\s+Up\s|\s+Get\s|\s+Activate|\n|$)',
+    re.IGNORECASE | re.DOTALL,
 )
 
 _BODY_DOLLAR_RE = re.compile(
