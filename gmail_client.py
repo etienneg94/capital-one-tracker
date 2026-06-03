@@ -216,7 +216,14 @@ _SECTION_CUTOFFS = re.compile(
 
 # Pass 1 — find every cashback percentage in the body
 _PCT_VALUE_RE = re.compile(
-    r'(?:Earn|Get)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%\s*(?:in\s+Rewards?|back|Rewards?)',
+    r'(?:Earn|Get|Activate|Save)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%\s*(?:in\s+Rewards?|back|Rewards?)',
+    re.IGNORECASE,
+)
+
+# "X% back at {STORE}" without an Earn/Get/Activate prefix
+_BARE_PCT_AT_RE = re.compile(
+    r'(\d+(?:\.\d+)?)\s*%\s*(?:in\s+Rewards?|back|Rewards?)\s+at\s+([\w][\w &\.\'\-]{2,38}?)'
+    r'(?=\s*[.,]|\s+(?:You|Up|Get|Activate|Earn|Shop|We|\n)|$)',
     re.IGNORECASE,
 )
 
@@ -258,7 +265,8 @@ def _collapse_urls(text: str) -> str:
     return re.sub(r'https?://\S{30,}', '[URL]', text)
 
 
-def _extract_offers_from_body(body: str, received: datetime, thread_id: str) -> list[dict]:
+def _extract_offers_from_body(body: str, received: datetime, thread_id: str,
+                              subject: str = '') -> list[dict]:
     """Return one dict per cashback offer found in the email body."""
     body = _normalize(body)
     body = _collapse_urls(body)
@@ -340,6 +348,27 @@ def _extract_offers_from_body(body: str, received: datetime, thread_id: str) -> 
     for m in _DOLLAR_AT_RE.finditer(body):
         add(float(m.group(1)), f"Up to ${m.group(1)} back", m.group(2).strip())
 
+    # -----------------------------------------------------------------------
+    # Strategy D — bare "X% back at {STORE}" without Earn/Get/Activate prefix
+    # -----------------------------------------------------------------------
+    for m in _BARE_PCT_AT_RE.finditer(body):
+        num = float(m.group(1))
+        pre = body[max(0, m.start() - 10): m.start()]
+        add(num, _pct_label(num, pre), m.group(2).strip())
+
+    # -----------------------------------------------------------------------
+    # Fallback — no offers found; try extracting from subject line
+    # -----------------------------------------------------------------------
+    if not results and subject:
+        store = extract_store(subject, '')
+        if store and store != 'Unknown':
+            # Look for any percentage in the subject
+            pct_m = re.search(r'(\d+(?:\.\d+)?)\s*%', subject)
+            if pct_m:
+                num = float(pct_m.group(1))
+                pre = subject[:pct_m.start()]
+                add(num, _pct_label(num, pre), store)
+
     return results
 
 
@@ -384,7 +413,8 @@ def fetch_capital_one_offers(
 
         body = get_body(msg.get('payload', {}))
         if body:
-            offers = _extract_offers_from_body(body, received, thread_id)
+            offers = _extract_offers_from_body(body, received, thread_id,
+                                               subject=headers.get('Subject', ''))
             all_offers.extend(offers)
             if debug and len(debug_samples) < 3:
                 html_raw, plain_raw = _decode_payload(msg.get('payload', {}))

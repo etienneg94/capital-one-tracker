@@ -257,7 +257,7 @@ st.caption(f"Showing **{len(filtered)}** stores · {int(filtered['Emails'].sum()
 # Table
 # ---------------------------------------------------------------------------
 
-display = filtered[['Store_display', 'Cashback_num', 'Cashback', 'Emails', 'Received', 'Email']].reset_index(drop=True)
+display = filtered[['Store_display', 'Cashback_num', 'Cashback', 'Emails', 'Received_dt', 'Email']].reset_index(drop=True)
 
 st.dataframe(
     display,
@@ -269,7 +269,8 @@ st.dataframe(
         'Cashback_num':  st.column_config.NumberColumn("Cashback %", width=120, format="%.4g%%"),
         'Cashback':      None,
         'Emails':        st.column_config.NumberColumn("Emails",   width=90,  format="%d"),
-        'Received':      st.column_config.TextColumn("Received (UTC)", width=210),
+        'Received_dt':   st.column_config.DatetimeColumn("Received (UTC)", width=210,
+                             format="MMM DD, YYYY HH:mm"),
         'Email':         st.column_config.LinkColumn(
                              "Open Email",
                              display_text="✉ View",
