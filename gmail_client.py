@@ -141,9 +141,16 @@ def extract_store(subject: str, snippet: str) -> str:
 
 
 def _clean_store(name: str) -> str:
-    name = name.strip().rstrip('!')
+    name = name.strip()
+    # Strip product-description junk like "Lunar New Year... Was 2% back"
+    name = re.sub(r'\s+[Ww]as\s+.*', '', name)
+    # Strip trailing ellipsis (… or ...) and anything after it
+    name = re.sub(r'\s*….*$', '', name)
+    name = re.sub(r'\s*\.{2,}.*$', '', name)
+    # Strip .com suffix, then any remaining trailing punctuation
     name = re.sub(r'\.com$', '', name, flags=re.IGNORECASE)
-    return name
+    name = re.sub(r'[.,!?]+$', '', name)
+    return name.strip()
 
 
 def _parse_date(date_str: str) -> datetime:
@@ -214,29 +221,40 @@ _SECTION_CUTOFFS = re.compile(
     re.IGNORECASE,
 )
 
-# Pass 1 — find every cashback percentage in the body
+# Direct single-pass offer match: "Earn X% [in Rewards[, Up to $N]] back at STORE"
+# STORE is matched lazily (1–3 words) and stops at:
+#   - "…" (ellipsis separator before product description)
+#   - " Was " (previous-rate indicator)
+#   - a capitalised word following whitespace (product description start)
+#   - comma / period-then-space / end of string
+_DIRECT_OFFER_RE = re.compile(
+    r'(?:Earn|Get|Activate|Save)\s+(?:up\s+to\s+)?'
+    r'(\d+(?:\.\d+)?)\s*%\s*'
+    r'(?:in\s+Rewards?,\s+Up\s+to\s+\$[\d,]+\s+at|(?:in\s+Rewards?|back|Rewards?)\s+at)\s+'
+    r'([\w][\w\'\-\.&]*(?:\s+[\w][\w\'\-\.&]*){0,2}?)'   # 1–3 words (lazy)
+    r'(?=\s+[A-Z][a-zA-Z]|\s*[,.](?:\s|$)|\s*…|\s+Was\b|\s*\n|\s*$)',
+    re.IGNORECASE,
+)
+
+# Retained for Strategy B (logo-preceded single-store emails)
 _PCT_VALUE_RE = re.compile(
     r'(?:Earn|Get|Activate|Save)\s+(?:up\s+to\s+)?(\d+(?:\.\d+)?)\s*%\s*(?:in\s+Rewards?|back|Rewards?)',
     re.IGNORECASE,
 )
 
-# "X% back at {STORE}" without an Earn/Get/Activate prefix
-_BARE_PCT_AT_RE = re.compile(
-    r'(\d+(?:\.\d+)?)\s*%\s*(?:in\s+Rewards?|back|Rewards?)\s+at\s+([\w][\w &\.\'\-]{2,38}?)'
-    r'(?=\s*[.,]|\s+(?:You|Up|Get|Activate|Earn|Shop|We|\n)|$)',
-    re.IGNORECASE,
-)
-
-# Pass 2 — find every "at {STORE}" anchor
-_AT_ANCHOR_RE = re.compile(
-    r'\bat\s+([\w][\w &\.\'\-]{2,38}?)(?=\s*[.,]|\s+(?:You|Up|Get|Activate|Earn|Shop|We|\n)|$)',
-    re.IGNORECASE,
-)
-
-# "Earn $X in Rewards at {STORE}"
+# "Earn $X [in Rewards] [back] at {STORE}" — "Rewards" and "back" are optional
 _DOLLAR_AT_RE = re.compile(
     r'(?:Earn|Get)\s+(?:up\s+to\s+)?\$(\d+(?:\.\d+)?)'
-    r'\s+(?:in\s+)?Rewards?\s+at\s+([\w][\w &\.\'\-]{2,38}?)(?=\.|,|\s+You\s|\s+Get\s|\n|$)',
+    r'\s+(?:(?:in\s+)?Rewards?\s+)?(?:back\s+)?at\s+([\w][\w &\.\'\-]{2,38}?)'
+    r'(?=\.|,|\s+You\s|\s+Get\s|\s+Was\s|\n|$)',
+    re.IGNORECASE,
+)
+
+# "Earn $X back on hotel bookings / event tickets" (category bonuses, not at-store)
+_DOLLAR_ON_CATEGORY_RE = re.compile(
+    r'(?:Earn|Get)\s+(?:up\s+to\s+)?\$(\d+(?:\.\d+)?)'
+    r'\s+(?:(?:in\s+)?Rewards?\s+)?back\s+on\s+'
+    r'(hotel\s+bookings?|event\s+tickets?|car\s+rentals?|flights?)',
     re.IGNORECASE,
 )
 
@@ -249,7 +267,9 @@ _PCT_BACK_RE = re.compile(
 # "{Store Name} logo"
 _LOGO_RE = re.compile(r'([A-Z][\w &\'\-]{1,38}?)\s+logo\b', re.IGNORECASE)
 
-# Generic non-store phrases to reject as store names
+# Generic non-store phrases to reject as store names from Strategy A/B.
+# Note: "hotel bookings" / "event tickets" are intentionally kept here to avoid
+# false "at hotel bookings" matches — Strategy E handles them via _DOLLAR_ON_CATEGORY_RE.
 _GENERIC_PHRASES = {
     'hotel', 'hotels', 'hotel bookings', 'event tickets', 'events',
     'travel', 'flights', 'car rentals', 'gift cards',
@@ -304,32 +324,23 @@ def _extract_offers_from_body(body: str, received: datetime, thread_id: str,
         })
 
     # -----------------------------------------------------------------------
-    # Strategy A — two-pass pairing (handles variable gap between % and store)
-    #
-    # Single-regex "Earn X%...{gap}...at {STORE}" breaks when the gap in the
-    # stripped HTML exceeds the window size and the regex skips to the NEXT
-    # "at {STORE}" block (wrong store). Two-pass solves this:
-    #   Pass 1: record every "Earn X%" position
-    #   Pass 2: record every "at {STORE}" position
-    #   Pair: each % → nearest following store anchor
+    # Strategy A — direct single-regex: "Earn X% back at STORE"
+    # Matches cashback and store in one shot; the lazy 1-3-word store capture
+    # stops at the first sign of a product description (capitalised word,
+    # ellipsis, "Was", punctuation), avoiding the wrong-pairing that the old
+    # two-pass approach suffered from.
     # -----------------------------------------------------------------------
-    pct_hits   = [(m.start(), m.end(), float(m.group(1)))
-                  for m in _PCT_VALUE_RE.finditer(body)]
-    store_hits = [(m.start(), _clean_store(m.group(1).strip()))
-                  for m in _AT_ANCHOR_RE.finditer(body)]
-
-    for pct_start, pct_end, num in pct_hits:
-        # Nearest "at {STORE}" that starts AFTER this % token
-        following = [(s, name) for s, name in store_hits if s >= pct_end]
-        if not following:
-            continue
-        _, store = min(following, key=lambda x: x[0])
-        pre = body[max(0, pct_start - 15): pct_start]
+    for m in _DIRECT_OFFER_RE.finditer(body):
+        num = float(m.group(1))
+        store = m.group(2).strip()
+        pre = body[max(0, m.start() - 15): m.start()]
         add(num, _pct_label(num, pre), store)
 
     # -----------------------------------------------------------------------
     # Strategy B — logo-preceded single-store emails (plain text format)
     # "{Store} logo [URL] Earn X% back"
+    # Guard: if "Earn X% back" is followed by "at {DIFFERENT_STORE}", the
+    # cashback belongs to that other store — skip the logo attribution.
     # -----------------------------------------------------------------------
     for logo_m in _LOGO_RE.finditer(body):
         store_candidate = logo_m.group(1).strip()
@@ -339,6 +350,12 @@ def _extract_offers_from_body(body: str, received: datetime, thread_id: str,
         pct_m = _PCT_BACK_RE.search(window)
         if pct_m:
             num = float(pct_m.group(1))
+            post = window[pct_m.end(): pct_m.end() + 80]
+            at_m = re.search(r'\bat\s+([\w][\w &\'\-]{1,30})', post, re.IGNORECASE)
+            if at_m:
+                other = _clean_store(at_m.group(1))
+                if other.lower() != store_candidate.lower():
+                    continue  # cashback is for a different store
             pre = window[:pct_m.start()]
             add(num, _pct_label(num, pre), store_candidate)
 
@@ -349,12 +366,24 @@ def _extract_offers_from_body(body: str, received: datetime, thread_id: str,
         add(float(m.group(1)), f"Up to ${m.group(1)} back", m.group(2).strip())
 
     # -----------------------------------------------------------------------
-    # Strategy D — bare "X% back at {STORE}" without Earn/Get/Activate prefix
+    # Strategy E — "Earn $X back on hotel bookings / event tickets / …"
+    # These use "on {category}" not "at {store}" so they bypass Strategy C.
+    # Added directly to results (skipping _GENERIC_PHRASES gate in add()).
     # -----------------------------------------------------------------------
-    for m in _BARE_PCT_AT_RE.finditer(body):
-        num = float(m.group(1))
-        pre = body[max(0, m.start() - 10): m.start()]
-        add(num, _pct_label(num, pre), m.group(2).strip())
+    for m in _DOLLAR_ON_CATEGORY_RE.finditer(body):
+        dollar = float(m.group(1))
+        category = m.group(2).strip().title()  # e.g. "Hotel Bookings"
+        key = (category.lower(), round(dollar, 2))
+        if key not in seen and dollar > 0:
+            seen.add(key)
+            results.append({
+                'Store':        category,
+                'Cashback':     f'${dollar:g} back',
+                'Cashback_num': dollar,
+                'Received':     received_str,
+                'Received_dt':  received,
+                'Email':        gmail_url,
+            })
 
     # -----------------------------------------------------------------------
     # Fallback — no offers found; try extracting from subject line
