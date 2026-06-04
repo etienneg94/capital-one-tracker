@@ -221,17 +221,45 @@ _SECTION_CUTOFFS = re.compile(
     re.IGNORECASE,
 )
 
-# Direct single-pass offer match: "Earn X% [in Rewards[, Up to $N]] back at STORE"
-# STORE is matched lazily (1–3 words) and stops at:
-#   - "…" (ellipsis separator before product description)
-#   - " Was " (previous-rate indicator)
-#   - a capitalised word following whitespace (product description start)
-#   - comma / period-then-space / end of string
+# Strategy A1: "Earn X% back at WORD WORD" — exactly 2 words, strong separator required.
+# "…" is intentionally excluded: in Capital One emails it appears AFTER the product
+# description, not immediately after the store, so including it would wrongly capture
+# "MomCozy SomePump" instead of stopping at just "MomCozy".
+# Stops at: word+colon ("Plus:"), pipe, comma, period+space, "Was", newline, end-of-string,
+# or one/two words followed by a pipe (catches "Warby Parker Intake Form |").
+_DIRECT_OFFER_2W_RE = re.compile(
+    r'(?:Earn|Get|Activate|Save)\s+(?:up\s+to\s+)?'
+    r'(\d+(?:\.\d+)?)\s*%\s*'
+    r'(?:in\s+Rewards?,\s+Up\s+to\s+\$[\d,]+\s+at|(?:in\s+Rewards?|back|Rewards?)\s+at)\s+'
+    r'([\w][\w\'\-&]*\s+[\w][\w\'\-&]*)'              # exactly 2 words (no . so period is a stop)
+    r'(?='
+        r'\s+\w+:'                                      # word+colon  e.g. "Plus:"
+        r'|\s*[|,]'                                     # pipe or comma  (NOT ellipsis)
+        r'|\s*\.(?:\s|$)'                              # period then space or end
+        r'|\s+Was\b'                                   # "Was" (previous rate)
+        r'|\s*\n|\s*$'                                 # newline or end-of-string
+        r'|\s+\w+\s+\w+\s*\|'                          # two words then pipe
+        r'|\s+\w+\s*\|'                                # one word then pipe
+    r')',
+    re.IGNORECASE,
+)
+
+# Strategy A2: "Earn X% back at WORD" — single word, stops at first capital after store.
 _DIRECT_OFFER_RE = re.compile(
     r'(?:Earn|Get|Activate|Save)\s+(?:up\s+to\s+)?'
     r'(\d+(?:\.\d+)?)\s*%\s*'
     r'(?:in\s+Rewards?,\s+Up\s+to\s+\$[\d,]+\s+at|(?:in\s+Rewards?|back|Rewards?)\s+at)\s+'
-    r'([\w][\w\'\-\.&]*(?:\s+[\w][\w\'\-\.&]*){0,2}?)'   # 1–3 words (lazy)
+    r'([\w][\w\'\-\.&]*)'                              # single word (greedy)
+    r'(?=\s+[A-Z][a-zA-Z]|\s*[,.](?:\s|$)|\s*…|\s+Was\b|\s*\n|\s*$)',
+    re.IGNORECASE,
+)
+
+# Strategy A3: bare "X% back at STORE" — no Earn/Get prefix (e.g. "Today's Top Offer" blocks).
+# Intentionally 1-word to avoid "Serta Top"-style false positives where "Top" is
+# part of "Today's Top Offer" heading, not the store name.
+_TOP_OFFER_RE = re.compile(
+    r'(\d+(?:\.\d+)?)\s*%\s*back\s+at\s+'
+    r'([\w][\w\'\-\.&]*)'                              # single word only
     r'(?=\s+[A-Z][a-zA-Z]|\s*[,.](?:\s|$)|\s*…|\s+Was\b|\s*\n|\s*$)',
     re.IGNORECASE,
 )
@@ -242,11 +270,29 @@ _PCT_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# "Earn $X [in Rewards] [back] at {STORE}" — "Rewards" and "back" are optional
+# "Earn $X [in Rewards] [back] at STORE" — 2-word version (strong separator)
+_DOLLAR_AT_2W_RE = re.compile(
+    r'(?:Earn|Get)\s+(?:up\s+to\s+)?\$(\d+(?:\.\d+)?)'
+    r'\s+(?:(?:in\s+)?Rewards?\s+)?(?:back\s+)?at\s+'
+    r'([\w][\w\'\-&]*\s+[\w][\w\'\-&]*)'              # exactly 2 words
+    r'(?='
+        r'\s+\w+:'
+        r'|\s*[|,]'
+        r'|\s*\.(?:\s|$)'
+        r'|\s+(?:Spend|Check|Was|You)\b'
+        r'|\s*\n|\s*$'
+        r'|\s+\w+\s+\w+\s*\|'
+        r'|\s+\w+\s*\|'
+    r')',
+    re.IGNORECASE,
+)
+
+# "Earn $X [in Rewards] [back] at STORE" — 1-word version
 _DOLLAR_AT_RE = re.compile(
     r'(?:Earn|Get)\s+(?:up\s+to\s+)?\$(\d+(?:\.\d+)?)'
-    r'\s+(?:(?:in\s+)?Rewards?\s+)?(?:back\s+)?at\s+([\w][\w &\.\'\-]{2,38}?)'
-    r'(?=\.|,|\s+You\s|\s+Get\s|\s+Was\s|\n|$)',
+    r'\s+(?:(?:in\s+)?Rewards?\s+)?(?:back\s+)?at\s+'
+    r'([\w][\w\'\-\.&]*)'                              # single word
+    r'(?=\s+[A-Z][a-zA-Z]|\s*[,.](?:\s|$)|\s+(?:Spend|Check|Was|You)\b|\s*\n|\s*$)',
     re.IGNORECASE,
 )
 
@@ -323,18 +369,67 @@ def _extract_offers_from_body(body: str, received: datetime, thread_id: str,
             'Email':        gmail_url,
         })
 
+    # claimed: tracks body positions of cashback numbers already matched by a
+    # percent regex, so A2/A3 don't produce a duplicate 1-word entry for the
+    # same offer that A1 already captured as a 2-word store name.
+    claimed: set[int] = set()
+
+    # claimed_dollar tracks body positions of dollar amounts already matched,
+    # so the 1-word fallback doesn't produce a duplicate "Total" entry when
+    # the 2-word version already captured "Total Wireless".
+    claimed_dollar: set[int] = set()
+
     # -----------------------------------------------------------------------
-    # Strategy A — direct single-regex: "Earn X% back at STORE"
-    # Matches cashback and store in one shot; the lazy 1-3-word store capture
-    # stops at the first sign of a product description (capitalised word,
-    # ellipsis, "Was", punctuation), avoiding the wrong-pairing that the old
-    # two-pass approach suffered from.
+    # Strategy C — Dollar amounts at store.
+    # Runs BEFORE percent strategies so that a "$80 back" label always wins
+    # over any spurious "80%" match for the same store+value.
+    # 2-word version first so "Total Wireless" beats "Total".
     # -----------------------------------------------------------------------
-    for m in _DIRECT_OFFER_RE.finditer(body):
+    for m in _DOLLAR_AT_2W_RE.finditer(body):
+        add(float(m.group(1)), f"${float(m.group(1)):g} back", m.group(2).strip())
+        claimed_dollar.add(m.start(1))
+
+    for m in _DOLLAR_AT_RE.finditer(body):
+        if m.start(1) in claimed_dollar:
+            continue
+        add(float(m.group(1)), f"${float(m.group(1)):g} back", m.group(2).strip())
+
+    # -----------------------------------------------------------------------
+    # Strategy A1 — 2-word percent stores (strong separator after 2nd word).
+    # Covers "Best Buy Plus:", "Warby Parker Intake Form |", "Allen Edmonds."
+    # -----------------------------------------------------------------------
+    for m in _DIRECT_OFFER_2W_RE.finditer(body):
         num = float(m.group(1))
         store = m.group(2).strip()
         pre = body[max(0, m.start() - 15): m.start()]
         add(num, _pct_label(num, pre), store)
+        claimed.add(m.start(1))
+
+    # -----------------------------------------------------------------------
+    # Strategy A2 — 1-word percent stores (skips positions claimed by A1).
+    # -----------------------------------------------------------------------
+    for m in _DIRECT_OFFER_RE.finditer(body):
+        if m.start(1) in claimed:
+            continue
+        num = float(m.group(1))
+        store = m.group(2).strip()
+        pre = body[max(0, m.start() - 15): m.start()]
+        add(num, _pct_label(num, pre), store)
+        claimed.add(m.start(1))
+
+    # -----------------------------------------------------------------------
+    # Strategy A3 — bare "X% back at STORE" without Earn/Get prefix.
+    # Covers "Today's Top Offer" blocks like "25% back at Famous Footwear".
+    # Greedy 1-or-2 words; skips positions already claimed by A1/A2.
+    # -----------------------------------------------------------------------
+    for m in _TOP_OFFER_RE.finditer(body):
+        if m.start(1) in claimed:
+            continue
+        num = float(m.group(1))
+        store = m.group(2).strip()
+        pre = body[max(0, m.start() - 10): m.start()]
+        add(num, _pct_label(num, pre), store)
+        claimed.add(m.start(1))
 
     # -----------------------------------------------------------------------
     # Strategy B — logo-preceded single-store emails (plain text format)
@@ -358,12 +453,6 @@ def _extract_offers_from_body(body: str, received: datetime, thread_id: str,
                     continue  # cashback is for a different store
             pre = window[:pct_m.start()]
             add(num, _pct_label(num, pre), store_candidate)
-
-    # -----------------------------------------------------------------------
-    # Strategy C — "Earn $X in Rewards at {STORE}"
-    # -----------------------------------------------------------------------
-    for m in _DOLLAR_AT_RE.finditer(body):
-        add(float(m.group(1)), f"Up to ${m.group(1)} back", m.group(2).strip())
 
     # -----------------------------------------------------------------------
     # Strategy E — "Earn $X back on hotel bookings / event tickets / …"
