@@ -276,13 +276,14 @@ _DOLLAR_AT_2W_RE = re.compile(
     r'\s+(?:(?:in\s+)?Rewards?\s+)?(?:back\s+)?at\s+'
     r'([\w][\w\'\-&]*\s+[\w][\w\'\-&]*)'              # exactly 2 words
     r'(?='
-        r'\s+\w+:'
-        r'|\s*[|,]'
-        r'|\s*\.(?:\s|$)'
-        r'|\s+(?:Spend|Check|Was|You)\b'
-        r'|\s*\n|\s*$'
-        r'|\s+\w+\s+\w+\s*\|'
-        r'|\s+\w+\s*\|'
+        r'\s+\w+:'                                          # word+colon e.g. "Plus:"
+        r'|\s*[|,]'                                         # pipe or comma
+        r'|\s*\.(?:\s|$)'                                  # period then space or end
+        r'|\s+(?:Spend|Check|Was|You)\b'                   # explicit stop words
+        r'|\s+(?:\w+\s+){1,4}Was\b'                        # product words then "Was" (catches "Consumer Reports Graco Was")
+        r'|\s*\n|\s*$'                                     # newline or end-of-string
+        r'|\s+\w+\s+\w+\s*\|'                              # two words then pipe
+        r'|\s+\w+\s*\|'                                    # one word then pipe
     r')',
     re.IGNORECASE,
 )

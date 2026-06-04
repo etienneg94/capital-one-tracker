@@ -266,8 +266,8 @@ st.dataframe(
     height=min(60 + len(display) * 38, 700),
     column_config={
         'Store_display': st.column_config.TextColumn("Store",      width=200),
-        'Cashback_num':  st.column_config.NumberColumn("Cashback %", width=120, format="%.4g%%"),
-        'Cashback':      None,
+        'Cashback_num':  None,                                      # hidden; used for sort only
+        'Cashback':      st.column_config.TextColumn("Cashback",   width=120),
         'Emails':        st.column_config.NumberColumn("Emails",   width=90,  format="%d"),
         'Received_dt':   st.column_config.DatetimeColumn("Received (UTC)", width=210,
                              format="MMM DD, YYYY HH:mm"),
