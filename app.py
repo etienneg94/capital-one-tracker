@@ -1,5 +1,6 @@
 import os
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 
@@ -40,6 +41,12 @@ div[data-testid="column"]:last-child .stButton > button {
 }
 div[data-testid="column"]:last-child .stButton > button:hover {
     background: #1a4f8a;
+}
+
+/* Scale up the dataframe canvas so cell text appears larger */
+[data-testid="stDataFrame"] {
+    zoom: 1.18;
+    transform-origin: top left;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -205,7 +212,7 @@ st.write("")
 # Controls row: time window + store filter + search + CSV
 # ---------------------------------------------------------------------------
 
-ctl1, ctl2, ctl3, ctl4 = st.columns([2, 2, 2, 1])
+ctl1, ctl2, ctl3, ctl4, ctl5 = st.columns([2, 2, 2, 1, 1])
 
 with ctl1:
     days_window = st.select_slider(
@@ -250,6 +257,33 @@ with ctl4:
         mime="text/csv",
         use_container_width=True,
     )
+
+with ctl5:
+    # Build tab-separated clipboard text from the filtered table
+    lines = ["Store\tCashback\tEmails\tReceived"]
+    for _, row in filtered.iterrows():
+        dt = row['Received_dt']
+        recv = dt.strftime('%b %d, %Y %H:%M UTC') if pd.notna(dt) else ''
+        lines.append(f"{row['Store']}\t{row['Cashback']}\t{int(row['Emails'])}\t{recv}")
+    clip = '\n'.join(lines).replace('\\', '\\\\').replace('`', '\\`')
+
+    components.html(f"""
+    <button id="cb" onclick="
+        navigator.clipboard.writeText(`{clip}`)
+        .then(()=>{{
+            document.getElementById('cb').innerHTML='✅ Copied!';
+            setTimeout(()=>document.getElementById('cb').innerHTML='📋 Copy',2000);
+        }})
+        .catch(()=>{{
+            document.getElementById('cb').innerHTML='❌ Error';
+            setTimeout(()=>document.getElementById('cb').innerHTML='📋 Copy',2000);
+        }});
+    " style="
+        width:100%; height:38px; background:#0a3166; color:white;
+        border:none; border-radius:6px; font-size:13px;
+        font-weight:600; cursor:pointer; font-family:sans-serif;
+    ">📋 Copy</button>
+    """, height=42)
 
 st.caption(f"Showing **{len(filtered)}** stores · {int(filtered['Emails'].sum())} emails")
 
